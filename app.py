@@ -8,9 +8,9 @@ def home():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json
-    print("SIGNAL:", data)
-    return {"status": "ok"}
+    print("HEADERS:", dict(request.headers))
+    print("BODY:", request.get_data(as_text=True))
+    return "OK", 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=8080)

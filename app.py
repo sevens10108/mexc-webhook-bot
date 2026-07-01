@@ -8,24 +8,23 @@ app = Flask(__name__)
 START_BALANCE = 1000.0
 STATE_FILE = "paper_state.json"
 
-POSITION_PCT = 1.0   # 1.0 = 100% баланса
-LEVERAGE = 1.0       # пока без плеча для безопасного paper-теста
-COMMISSION_PCT = 0.0004  # 0.04% как в TradingView
+COMMISSION_RATE = 0.0004  # 0.04%
+POSITION_PERCENT = 1.0    # 100% баланса в сделку
 
 
-def empty_state():
+def default_state():
     return {
         "balance": START_BALANCE,
         "position": None,
         "entry_price": None,
-        "contracts": 0.0,
+        "contracts": 0.0,   # BTC amount
         "trades": []
     }
 
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return empty_state()
+        return default_state()
 
     with open(STATE_FILE, "r") as f:
         return json.load(f)
@@ -39,7 +38,7 @@ def save_state(state):
 def to_float(value, default=0.0):
     try:
         return float(str(value).replace(",", "."))
-    except Exception:
+    except:
         return default
 
 
@@ -59,20 +58,17 @@ def target_side_from_position(position_value):
 
 
 def calc_contracts(balance, price):
-    if price is None or price <= 0:
-        return 0.0
-
-    position_usdt = balance * POSITION_PCT * LEVERAGE
+    position_usdt = balance * POSITION_PERCENT
     return position_usdt / price
 
 
 def calc_commission(price, contracts):
-    return abs(price * contracts) * COMMISSION_PCT
+    return price * contracts * COMMISSION_RATE
 
 
-def close_position(state, price, now, reason="close"):
+def close_position(state, price, now):
     if state["position"] is None or state["entry_price"] is None:
-        return 0.0
+        return 0.0, 0.0, 0.0
 
     side = state["position"]
     entry = float(state["entry_price"])
@@ -83,20 +79,20 @@ def close_position(state, price, now, reason="close"):
     else:
         gross_pnl = (entry - price) * contracts
 
-    close_commission = calc_commission(price, contracts)
-    net_pnl = gross_pnl - close_commission
+    exit_commission = calc_commission(price, contracts)
+    net_pnl = gross_pnl - exit_commission
 
     state["balance"] += net_pnl
 
     state["trades"].append({
         "time": now,
-        "type": reason,
+        "type": "close",
         "side": side,
         "entry_price": entry,
         "exit_price": price,
         "contracts": contracts,
         "gross_pnl": gross_pnl,
-        "commission": close_commission,
+        "exit_commission": exit_commission,
         "net_pnl": net_pnl,
         "balance": state["balance"]
     })
@@ -105,14 +101,15 @@ def close_position(state, price, now, reason="close"):
     state["entry_price"] = None
     state["contracts"] = 0.0
 
-    return net_pnl
+    return gross_pnl, exit_commission, net_pnl
 
 
 def open_position(state, side, price, now):
     contracts = calc_contracts(state["balance"], price)
-    open_commission = calc_commission(price, contracts)
+    entry_commission = calc_commission(price, contracts)
 
-    state["balance"] -= open_commission
+    state["balance"] -= entry_commission
+
     state["position"] = side
     state["entry_price"] = price
     state["contracts"] = contracts
@@ -123,12 +120,11 @@ def open_position(state, side, price, now):
         "side": side,
         "entry_price": price,
         "contracts": contracts,
-        "position_usdt": price * contracts,
-        "commission": open_commission,
+        "entry_commission": entry_commission,
         "balance": state["balance"]
     })
 
-    return contracts, open_commission
+    return contracts, entry_commission
 
 
 @app.route("/", methods=["GET"])
@@ -136,11 +132,7 @@ def home():
     state = load_state()
     return jsonify({
         "status": "TradingView Webhook Server Running",
-        "mode": "PAPER_TRADING_BALANCE_BASED",
-        "start_balance": START_BALANCE,
-        "position_pct": POSITION_PCT,
-        "leverage": LEVERAGE,
-        "commission_pct": COMMISSION_PCT,
+        "mode": "PAPER_TRADING_REALISTIC_PNL",
         "balance": state["balance"],
         "position": state["position"],
         "entry_price": state["entry_price"],
@@ -172,12 +164,10 @@ def webhook():
 
     tv_order_contracts = to_float(data.get("contracts", 0), 0.0)
     tv_target_position = to_float(data.get("position", 0), 0.0)
-
     target_side = target_side_from_position(tv_target_position)
-    price = get_price(data)
 
+    price = get_price(data)
     state = load_state()
-    current_side = state["position"]
 
     print("ACTION:", action)
     print("TICKER:", ticker)
@@ -186,25 +176,33 @@ def webhook():
     print("TARGET SIDE:", target_side)
     print("PRICE:", price)
     print("CURRENT BALANCE:", state["balance"])
-    print("CURRENT POSITION:", current_side)
+    print("CURRENT POSITION:", state["position"])
     print("CURRENT CONTRACTS:", state["contracts"])
 
     if price is None:
-        print("NO PRICE IN SIGNAL — SIGNAL LOGGED ONLY")
+        print("NO PRICE — SIGNAL LOGGED ONLY")
         return jsonify({"status": "ok", "message": "no price", "received": data})
+
+    current_side = state["position"]
 
     if target_side == current_side:
         print("SAME TARGET SIDE — NO OPEN/CLOSE")
-        print("TradingView position changed, but paper bot keeps its own balance-based size.")
+        print("Paper bot keeps own balance-based position size.")
 
     else:
         if current_side is not None:
-            net_pnl = close_position(state, price, now, reason="reverse_or_close")
-            print(f"CLOSED {current_side.upper()} | NET PNL: {net_pnl:.4f} USDT")
+            gross_pnl, exit_commission, net_pnl = close_position(state, price, now)
+            print(f"CLOSED {current_side.upper()}")
+            print(f"GROSS PNL: {gross_pnl:.4f} USDT")
+            print(f"EXIT COMMISSION: {exit_commission:.4f} USDT")
+            print(f"NET PNL: {net_pnl:.4f} USDT")
 
         if target_side is not None:
-            contracts, commission = open_position(state, target_side, price, now)
-            print(f"OPENED {target_side.upper()} | PRICE: {price} | CONTRACTS: {contracts:.8f} BTC | COMMISSION: {commission:.4f}")
+            contracts, entry_commission = open_position(state, target_side, price, now)
+            print(f"OPENED {target_side.upper()}")
+            print(f"PRICE: {price}")
+            print(f"CONTRACTS: {contracts} BTC")
+            print(f"ENTRY COMMISSION: {entry_commission:.4f} USDT")
         else:
             print("TARGET POSITION IS FLAT — POSITION CLOSED ONLY")
 
@@ -217,12 +215,11 @@ def webhook():
 
     return jsonify({
         "status": "ok",
-        "mode": "paper_trading_balance_based",
+        "mode": "paper_trading_realistic_pnl",
         "balance": state["balance"],
         "position": state["position"],
         "entry_price": state["entry_price"],
         "contracts": state["contracts"],
-        "tv_target_position": tv_target_position,
         "received": data
     })
 
@@ -234,14 +231,13 @@ def status():
 
 @app.route("/reset", methods=["GET"])
 def reset():
-    state = empty_state()
+    state = default_state()
     save_state(state)
     return jsonify({
         "status": "reset",
         "balance": START_BALANCE,
         "position": None,
-        "contracts": 0.0,
-        "trades": []
+        "contracts": 0.0
     })
 
 

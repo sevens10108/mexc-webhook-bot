@@ -50,6 +50,44 @@ def side_from_position(position: float) -> Optional[str]:
     return "long" if position > 0 else "short"
 
 
+def normalize_order_text(value: Any) -> str:
+    return " ".join(str(value or "").strip().upper().split())
+
+
+def classify_order(data: dict[str, Any]) -> tuple[str, Optional[str], str, str]:
+    """
+    Return: (command, side, order_id, order_comment)
+
+    command:
+      - "entry"
+      - "exit"
+      - "margin_call"
+      - "unknown"
+    """
+    order_id = normalize_order_text(data.get("order_id"))
+    order_comment = normalize_order_text(data.get("order_comment"))
+
+    combined = f"{order_id} {order_comment}".strip()
+    if "MARGIN CALL" in combined:
+        return "margin_call", None, order_id, order_comment
+
+    # strategy.close("LONG", comment="SMART EXIT LONG") keeps order_id=LONG,
+    # so comments must be checked before ordinary entry IDs.
+    if order_comment in {"SMART EXIT LONG", "LONG EXIT"} or order_id == "LONG EXIT":
+        return "exit", "long", order_id, order_comment
+
+    if order_comment in {"SMART EXIT SHORT", "SHORT EXIT"} or order_id == "SHORT EXIT":
+        return "exit", "short", order_id, order_comment
+
+    if order_id == "LONG" and order_comment not in {"SMART EXIT LONG", "LONG EXIT"}:
+        return "entry", "long", order_id, order_comment
+
+    if order_id == "SHORT" and order_comment not in {"SMART EXIT SHORT", "SHORT EXIT"}:
+        return "entry", "short", order_id, order_comment
+
+    return "unknown", None, order_id, order_comment
+
+
 def get_price(data: dict[str, Any]) -> Optional[float]:
     for key in ("price", "close", "strategy.order.price"):
         if key in data:
@@ -77,7 +115,7 @@ def calculate_contracts(balance: float, price: float) -> float:
 def default_state() -> dict[str, Any]:
     now = utc_now()
     return {
-        "version": 3,
+        "version": 4,
         "balance": START_BALANCE,
         "position": None,
         "entry_price": None,
@@ -252,7 +290,7 @@ def home():
         state = load_state()
     return jsonify({
         "status": "TradingView Webhook Server Running",
-        "mode": "PAPER_TV_SIDE_SYNC_MEXC_FEES",
+        "mode": "PAPER_ORDER_ID_SYNC_MEXC_FEES",
         "balance": state["balance"],
         "position": state["position"],
         "entry_price": state["entry_price"],
@@ -273,6 +311,7 @@ def home():
 def webhook():
     now = utc_now()
     raw_body = request.get_data(as_text=True)
+
     try:
         data = request.get_json(force=True, silent=False)
         if not isinstance(data, dict):
@@ -287,14 +326,20 @@ def webhook():
     tv_position = float(to_float(data.get("position"), 0.0) or 0.0)
     price = get_price(data)
     key = make_signal_key(data)
+    command, command_side, order_id, order_comment = classify_order(data)
 
     with LOCK:
         state = load_state()
+
         print("=" * 78, flush=True)
         print(f"NEW TRADINGVIEW SIGNAL: {now}", flush=True)
         print(f"RAW BODY: {raw_body}", flush=True)
         print(f"ACTION: {action}", flush=True)
         print(f"TICKER: {ticker}", flush=True)
+        print(f"ORDER ID: {order_id}", flush=True)
+        print(f"ORDER COMMENT: {order_comment}", flush=True)
+        print(f"COMMAND: {command}", flush=True)
+        print(f"COMMAND SIDE: {command_side}", flush=True)
         print(f"TV ORDER CONTRACTS: {tv_order_contracts}", flush=True)
         print(f"TV POSITION: {tv_position}", flush=True)
         print(f"PRICE: {price}", flush=True)
@@ -306,70 +351,174 @@ def webhook():
             "signal_key": key,
             "action": action,
             "ticker": ticker,
+            "order_id": order_id,
+            "order_comment": order_comment,
+            "command": command,
+            "command_side": command_side,
             "tv_order_contracts": tv_order_contracts,
             "tv_position": tv_position,
             "price": price,
             "raw": data,
         })
 
-        if price is None:
-            remember_signal(state, key)
-            save_state(state)
-            return jsonify({"status": "ignored", "reason": "no_valid_price"}), 200
-
+        # Duplicate check comes before any state mutation.
         if key in state.get("recent_signal_keys", []):
-            append_event("webhook_ignored", {"reason": "duplicate", "signal_key": key})
+            append_event("webhook_ignored", {
+                "reason": "duplicate",
+                "signal_key": key,
+                "order_id": order_id,
+                "order_comment": order_comment,
+            })
             return jsonify({"status": "ignored", "reason": "duplicate"}), 200
 
-        old_tv_position = float(to_float(state.get("last_tv_position"), 0.0) or 0.0)
-        old_tv_side = side_from_position(old_tv_position)
-        new_tv_side = side_from_position(tv_position)
-        bot_side = state.get("position")
+        # Remember every non-duplicate message, including ignored service messages.
+        remember_signal(state, key)
 
-        # Critical fix: quantity changes inside the same side are not new trades.
-        if old_tv_side == new_tv_side:
-            state["last_tv_position"] = tv_position
-            remember_signal(state, key)
+        if price is None:
             save_state(state)
-            reason = "tv_position_unchanged" if old_tv_position == tv_position else "same_side_size_update"
             append_event("webhook_ignored", {
-                "reason": reason,
-                "old_tv_position": old_tv_position,
-                "new_tv_position": tv_position,
-                "side": new_tv_side,
+                "reason": "no_valid_price",
+                "order_id": order_id,
+                "order_comment": order_comment,
+            })
+            return jsonify({"status": "ignored", "reason": "no_valid_price"}), 200
+
+        # TradingView broker-emulator service orders are never trading commands.
+        # Do NOT update last_tv_position here; the next real LONG/SHORT order
+        # must still be recognized from the previous confirmed trading state.
+        if command == "margin_call":
+            save_state(state)
+            append_event("webhook_ignored", {
+                "reason": "margin_call",
+                "order_id": order_id,
+                "order_comment": order_comment,
+                "tv_position": tv_position,
+                "tv_order_contracts": tv_order_contracts,
             })
             return jsonify({
                 "status": "ignored",
-                "reason": reason,
+                "reason": "margin_call",
                 "balance": state["balance"],
                 "position": state["position"],
-                "entry_price": state["entry_price"],
-                "contracts": state["contracts"],
-                "tv_position": tv_position,
+                "last_tv_position": state["last_tv_position"],
             }), 200
 
-        result: dict[str, Any] = {"status": "ok", "mode": "paper_tv_side_sync_mexc_fees"}
+        # Strict allow-list. Unknown order IDs/comments must never open or close
+        # a position merely because TradingView's position size changed.
+        if command == "unknown":
+            save_state(state)
+            append_event("webhook_ignored", {
+                "reason": "unknown_order",
+                "order_id": order_id,
+                "order_comment": order_comment,
+                "action": action,
+                "tv_position": tv_position,
+            })
+            return jsonify({
+                "status": "ignored",
+                "reason": "unknown_order",
+                "order_id": order_id,
+                "order_comment": order_comment,
+                "balance": state["balance"],
+                "position": state["position"],
+            }), 200
 
-        if bot_side is not None:
+        result: dict[str, Any] = {
+            "status": "ok",
+            "mode": "paper_order_id_sync_mexc_fees",
+            "order_id": order_id,
+            "order_comment": order_comment,
+            "command": command,
+            "command_side": command_side,
+        }
+
+        bot_side = state.get("position")
+
+        if command == "entry":
+            # Repeated same-side entry/size adjustment: ignore safely.
+            if bot_side == command_side:
+                state["last_tv_position"] = tv_position
+                save_state(state)
+                append_event("webhook_ignored", {
+                    "reason": "same_side_entry_or_size_update",
+                    "order_id": order_id,
+                    "order_comment": order_comment,
+                    "side": command_side,
+                    "tv_position": tv_position,
+                })
+                return jsonify({
+                    "status": "ignored",
+                    "reason": "same_side_entry_or_size_update",
+                    "balance": state["balance"],
+                    "position": state["position"],
+                    "entry_price": state["entry_price"],
+                    "contracts": state["contracts"],
+                    "tv_position": tv_position,
+                }), 200
+
+            # Reversal safety: close the opposite bot side first.
+            if bot_side is not None and bot_side != command_side:
+                close_result = close_position(state, price, now, data)
+                result["closed"] = close_result
+                append_event("position_reversal", {
+                    "from_side": bot_side,
+                    "to_side": command_side,
+                    "price": price,
+                    "order_id": order_id,
+                    "order_comment": order_comment,
+                })
+
+            open_result = open_position(state, command_side, price, now, data)
+            result["opened"] = open_result
+            result["action_taken"] = f"opened_{command_side}"
+            state["last_tv_position"] = tv_position
+
+        elif command == "exit":
+            if bot_side is None:
+                # Exit without an open bot position can happen after restart or
+                # because a service order was correctly ignored.
+                state["last_tv_position"] = tv_position
+                save_state(state)
+                append_event("webhook_ignored", {
+                    "reason": "exit_without_open_position",
+                    "order_id": order_id,
+                    "order_comment": order_comment,
+                    "exit_side": command_side,
+                    "tv_position": tv_position,
+                })
+                return jsonify({
+                    "status": "ignored",
+                    "reason": "exit_without_open_position",
+                    "balance": state["balance"],
+                    "position": state["position"],
+                    "tv_position": tv_position,
+                }), 200
+
+            if command_side is not None and bot_side != command_side:
+                # Never close a LONG with a SHORT-exit label, or vice versa.
+                save_state(state)
+                append_event("webhook_ignored", {
+                    "reason": "exit_side_mismatch",
+                    "order_id": order_id,
+                    "order_comment": order_comment,
+                    "bot_side": bot_side,
+                    "exit_side": command_side,
+                    "tv_position": tv_position,
+                })
+                return jsonify({
+                    "status": "ignored",
+                    "reason": "exit_side_mismatch",
+                    "balance": state["balance"],
+                    "position": state["position"],
+                }), 200
+
             close_result = close_position(state, price, now, data)
             result["closed"] = close_result
-            print(f"CLOSED {bot_side.upper()}", flush=True)
-            print(f"GROSS PNL: {close_result['gross_pnl']:.8f}", flush=True)
-            print(f"EXIT COMMISSION: {close_result['exit_fee']:.8f}", flush=True)
-            print(f"TOTAL TRADE PNL: {close_result['total_trade_pnl']:.8f}", flush=True)
-
-        if new_tv_side is not None:
-            open_result = open_position(state, new_tv_side, price, now, data)
-            result["opened"] = open_result
-            result["action_taken"] = f"opened_{new_tv_side}"
-            print(f"OPENED {new_tv_side.upper()}", flush=True)
-            print(f"ENTRY COMMISSION: {open_result['entry_fee']:.8f}", flush=True)
-        else:
             result["action_taken"] = "closed_to_flat"
-            print("TV POSITION FLAT — POSITION CLOSED ONLY", flush=True)
+            # An exit command is authoritative even if a tiny residual TV
+            # position is reported by a later Margin Call message.
+            state["last_tv_position"] = 0.0
 
-        state["last_tv_position"] = tv_position
-        remember_signal(state, key)
         save_state(state)
 
         result.update({
@@ -381,6 +530,7 @@ def webhook():
             "tv_position": tv_position,
             "received": data,
         })
+
         print(f"NEW BALANCE: {state['balance']}", flush=True)
         print(f"NEW POSITION: {state['position']}", flush=True)
         print("=" * 78, flush=True)
